@@ -554,6 +554,69 @@ impl TaskBoardView {
         chips
     }
 
+    /// Persist a section's visibility to `task_board.hidden_statuses` in the
+    /// user settings; the settings observer then refreshes every open board.
+    fn set_status_hidden(&self, status: TaskStatus, hidden: bool, cx: &mut App) {
+        let Some(workspace) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.upgrade())
+        else {
+            return;
+        };
+        let fs = workspace.read(cx).project().read(cx).fs().clone();
+        settings::update_settings_file(fs, cx, move |content, _| {
+            let task_board = content.task_board.get_or_insert_default();
+            let mut hidden_statuses = task_board.hidden_statuses.clone().unwrap_or_default();
+            let key = status.as_str().to_string();
+            if hidden {
+                if !hidden_statuses.contains(&key) {
+                    hidden_statuses.push(key);
+                }
+            } else {
+                hidden_statuses.retain(|existing| existing != &key);
+            }
+            task_board.hidden_statuses = Some(hidden_statuses);
+        });
+    }
+
+    /// A toolbar menu listing every section with a checkmark; unchecking
+    /// hides it, and hidden sections can be re-enabled from here.
+    fn render_sections_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hidden_statuses = TaskBoardSettings::get_global(cx).hidden_statuses.clone();
+        let this = cx.entity().downgrade();
+
+        ui::PopoverMenu::new("board-sections")
+            .trigger(
+                IconButton::new("board-sections-button", IconName::ListCollapse)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Show or hide sections")),
+            )
+            .menu(move |window, cx| {
+                let hidden_statuses = hidden_statuses.clone();
+                let this = this.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                    for status in TaskStatus::ALL {
+                        let this = this.clone();
+                        let currently_hidden = hidden_statuses.contains(&status);
+                        menu = menu.toggleable_entry(
+                            status.label(),
+                            !currently_hidden,
+                            IconPosition::Start,
+                            None,
+                            move |_window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.set_status_hidden(status, !currently_hidden, cx);
+                                })
+                                .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+    }
+
     fn open_task_detail(
         &mut self,
         task_id: BoardTaskId,
@@ -583,6 +646,7 @@ impl TaskBoardView {
             .border_color(cx.theme().colors().border)
             .child(Label::new("Task Board"))
             .child(self.render_project_filter(window, cx))
+            .child(self.render_sections_menu(cx))
             .child(
                 IconButton::new("show-archived", IconName::Eye)
                     .icon_size(IconSize::Small)
@@ -678,6 +742,10 @@ impl TaskBoardView {
             .border_color(cx.theme().colors().border)
             .child(
                 h_flex()
+                    .group(SharedString::from(format!(
+                        "task-column-header-{}",
+                        status.as_str()
+                    )))
                     .p_2()
                     .gap_1()
                     .border_b_1()
@@ -687,6 +755,22 @@ impl TaskBoardView {
                         Label::new(card_count.to_string())
                             .size(LabelSize::Small)
                             .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("hide-section-{}", status.as_str())),
+                            IconName::EyeOff,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .visible_on_hover(SharedString::from(format!(
+                            "task-column-header-{}",
+                            status.as_str()
+                        )))
+                        .tooltip(Tooltip::text("Hide this section"))
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.set_status_hidden(status, true, cx);
+                        })),
                     ),
             )
             .child(
