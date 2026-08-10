@@ -4,7 +4,7 @@ use gpui::{
     Action as _, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, ScrollHandle,
     SharedString, Subscription, Task, WeakEntity, Window,
 };
-use project::TaskSourceKind;
+use project::{ProjectGroupKey, TaskSourceKind};
 use settings::Settings as _;
 use task::{TaskContext, TaskTemplate};
 use ui::{Chip, ContextMenu, DropdownMenu, Indicator, Tooltip, prelude::*, right_click_menu};
@@ -59,17 +59,32 @@ impl Render for DraggedTaskCard {
     }
 }
 
+/// What the project dropdown is set to. `WorkspaceProjects` (the default)
+/// shows tasks from every board project whose repository folders are part of
+/// the current workspace.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ProjectFilterChoice {
+    #[default]
+    WorkspaceProjects,
+    AllProjects,
+    Project(BoardProjectId),
+}
+
 pub struct TaskBoardView {
     focus_handle: FocusHandle,
     store: Entity<TaskBoardStore>,
     workspace: Option<WeakEntity<Workspace>>,
     columns: Vec<ColumnSnapshot>,
+    project_choice: ProjectFilterChoice,
     filter: BoardFilter,
     filter_editor: Entity<Editor>,
     board_scroll_handle: ScrollHandle,
     gh_setup: Option<GhSetupStatus>,
     gh_banner_dismissed: bool,
     _subscriptions: Vec<Subscription>,
+    /// Refreshes the workspace-projects filter when folders are added to or
+    /// removed from the board's workspace; rebound on each workspace add.
+    _project_subscription: Option<Subscription>,
     _pr_refresh_task: Task<()>,
 }
 
@@ -218,6 +233,7 @@ impl TaskBoardView {
             store,
             workspace: None,
             columns: Vec::new(),
+            project_choice: ProjectFilterChoice::default(),
             filter: BoardFilter::default(),
             filter_editor,
             board_scroll_handle: ScrollHandle::new(),
@@ -228,6 +244,7 @@ impl TaskBoardView {
                 filter_subscription,
                 settings_subscription,
             ],
+            _project_subscription: None,
             _pr_refresh_task,
         };
         this.recompute(cx);
@@ -378,6 +395,7 @@ impl TaskBoardView {
     }
 
     fn recompute(&mut self, cx: &mut Context<Self>) {
+        self.resolve_project_filter(cx);
         let hidden_statuses = &TaskBoardSettings::get_global(cx).hidden_statuses;
         let store = self.store.read(cx);
 
@@ -554,6 +572,44 @@ impl TaskBoardView {
         chips
     }
 
+    /// Resolve the dropdown choice into a concrete project set for the
+    /// store's filter. "Workspace projects" matches every board project with
+    /// at least one repository folder in this board's workspace, so a
+    /// workspace holding folders A, B, and C shows the tasks of all three.
+    fn resolve_project_filter(&mut self, cx: &App) {
+        self.filter.projects = match self.project_choice {
+            ProjectFilterChoice::AllProjects => None,
+            ProjectFilterChoice::Project(project_id) => Some(vec![project_id]),
+            ProjectFilterChoice::WorkspaceProjects => {
+                let workspace_paths: std::collections::HashSet<_> = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.upgrade())
+                    .map(|workspace| {
+                        ProjectGroupKey::from_project(workspace.read(cx).project().read(cx), cx)
+                            .path_list()
+                            .ordered_paths()
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(
+                    self.store
+                        .read(cx)
+                        .projects()
+                        .filter(|project| {
+                            project
+                                .main_worktree_paths
+                                .ordered_paths()
+                                .any(|path| workspace_paths.contains(path))
+                        })
+                        .map(|project| project.project_id)
+                        .collect(),
+                )
+            }
+        };
+    }
+
     /// Persist a section's visibility to `task_board.hidden_statuses` in the
     /// user settings; the settings observer then refreshes every open board.
     fn set_status_hidden(&self, status: TaskStatus, hidden: bool, cx: &mut App) {
@@ -685,12 +741,14 @@ impl TaskBoardView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let store = self.store.read(cx);
-        let label = self
-            .filter
-            .project
-            .and_then(|id| store.project(id))
-            .map(|project| project.display_name.clone())
-            .unwrap_or_else(|| "All projects".into());
+        let label: SharedString = match self.project_choice {
+            ProjectFilterChoice::WorkspaceProjects => "Workspace projects".into(),
+            ProjectFilterChoice::AllProjects => "All projects".into(),
+            ProjectFilterChoice::Project(project_id) => store
+                .project(project_id)
+                .map(|project| project.display_name.clone())
+                .unwrap_or_else(|| "All projects".into()),
+        };
 
         let projects: Vec<(BoardProjectId, SharedString)> = store
             .projects()
@@ -702,16 +760,23 @@ impl TaskBoardView {
             "board-project-filter",
             label,
             ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                menu = menu.entry("Workspace projects", None, {
+                    let this = this.clone();
+                    move |_window, cx| {
+                        set_project_filter(&this, ProjectFilterChoice::WorkspaceProjects, cx);
+                    }
+                });
                 menu = menu.entry("All projects", None, {
                     let this = this.clone();
                     move |_window, cx| {
-                        set_project_filter(&this, None, cx);
+                        set_project_filter(&this, ProjectFilterChoice::AllProjects, cx);
                     }
                 });
+                menu = menu.separator();
                 for (project_id, name) in projects {
                     let this = this.clone();
                     menu = menu.entry(name, None, move |_window, cx| {
-                        set_project_filter(&this, Some(project_id), cx);
+                        set_project_filter(&this, ProjectFilterChoice::Project(project_id), cx);
                     });
                 }
                 menu
@@ -1153,11 +1218,11 @@ fn build_card_menu(
 
 fn set_project_filter(
     this: &WeakEntity<TaskBoardView>,
-    project: Option<BoardProjectId>,
+    choice: ProjectFilterChoice,
     cx: &mut App,
 ) {
     this.update(cx, |this, cx| {
-        this.filter.project = project;
+        this.project_choice = choice;
         this.recompute(cx);
     })
     .ok();
@@ -1249,9 +1314,30 @@ impl Item for TaskBoardView {
         &mut self,
         workspace: &mut Workspace,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.workspace = Some(workspace.weak_handle());
+        // Folders added to or removed from the workspace change what the
+        // workspace-projects filter matches.
+        self._project_subscription = Some(cx.subscribe(
+            workspace.project(),
+            |this: &mut Self, _, event, cx| match event {
+                project::Event::WorktreeAdded(_)
+                | project::Event::WorktreeRemoved(_)
+                | project::Event::WorktreeOrderChanged => {
+                    this.recompute(cx);
+                }
+                _ => {}
+            },
+        ));
+        // The workspace-projects filter can only resolve once the workspace
+        // handle exists — but this hook runs inside the workspace's own
+        // update, so reading it back through the handle must wait until
+        // that update finishes.
+        let this = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            this.update(cx, |this, cx| this.recompute(cx)).ok();
+        });
     }
 
     fn clone_on_split(

@@ -62,7 +62,8 @@ pub struct TaskSessionInfo {
 /// Filters applied by board surfaces when listing tasks.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BoardFilter {
-    pub project: Option<BoardProjectId>,
+    /// Show only tasks belonging to any of these projects; `None` shows all.
+    pub projects: Option<Vec<BoardProjectId>>,
     pub tags: Vec<SharedString>,
     pub query: SharedString,
     pub show_archived: bool,
@@ -73,8 +74,10 @@ impl BoardFilter {
         if task.archived && !self.show_archived {
             return false;
         }
-        if let Some(project) = self.project
-            && !task.all_project_ids().any(|project_id| project_id == project)
+        if let Some(projects) = &self.projects
+            && !task
+                .all_project_ids()
+                .any(|project_id| projects.contains(&project_id))
         {
             return false;
         }
@@ -1371,7 +1374,7 @@ mod tests {
             // Filtering by either project surfaces the task.
             for project in [primary, sdk] {
                 let filter = BoardFilter {
-                    project: Some(project),
+                    projects: Some(vec![project]),
                     ..Default::default()
                 };
                 assert_eq!(store.tasks_for_column(TaskStatus::Todo, &filter).len(), 1);
