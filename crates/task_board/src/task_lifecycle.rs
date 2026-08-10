@@ -150,16 +150,7 @@ pub fn start_task(
                 .await?
         };
 
-        let repositories: Vec<Entity<Repository>> =
-            project_workspace.read_with(cx, |workspace, cx| {
-                workspace
-                    .project()
-                    .read(cx)
-                    .repositories(cx)
-                    .values()
-                    .cloned()
-                    .collect()
-            });
+        let repositories = wait_for_repositories(&project_workspace, cx).await?;
         let repository = repositories
             .first()
             .cloned()
@@ -233,6 +224,14 @@ pub fn start_task(
                 .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
                 .collect()
         });
+        // The created workspace carries any non-git roots of the source
+        // project over unchanged; they must be neither branched (checkout
+        // would fail) nor recorded as task worktrees (finishing would try to
+        // archive the original folder).
+        let new_paths: Vec<PathBuf> = new_paths
+            .into_iter()
+            .filter(|path| path.join(".git").exists())
+            .collect();
         anyhow::ensure!(!new_paths.is_empty(), "no worktree was created");
 
         for path in &new_paths {
@@ -417,6 +416,44 @@ pub fn create_pull_request(
 }
 
 /// The git store discovers repositories asynchronously after a workspace
+/// opens; poll until the list is non-empty and stable across two reads so
+/// multi-repo workspaces aren't scanned half-discovered.
+async fn wait_for_repositories(
+    workspace: &Entity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) -> Result<Vec<Entity<Repository>>> {
+    let read_repositories = |cx: &mut AsyncWindowContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .repositories(cx)
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let mut previous_count = 0;
+    for _ in 0..40 {
+        let repositories = read_repositories(cx);
+        if !repositories.is_empty() && repositories.len() == previous_count {
+            return Ok(repositories);
+        }
+        previous_count = repositories.len();
+        cx.background_executor()
+            .timer(Duration::from_millis(250))
+            .await;
+    }
+    let repositories = read_repositories(cx);
+    anyhow::ensure!(
+        !repositories.is_empty(),
+        "no git repository detected in the task's project"
+    );
+    Ok(repositories)
+}
+
+/// The git store discovers repositories asynchronously after a workspace
 /// opens, so poll briefly instead of failing on the first read.
 async fn wait_for_repository(
     workspace: &Entity<Workspace>,
@@ -582,26 +619,47 @@ pub fn finish_task(
             })?;
 
             for worktree_path in worktree_paths {
-                cleanup_task_worktree(
-                    task_id,
-                    worktree_path,
-                    group_key.clone(),
-                    multi_workspace.clone(),
-                    source_workspace.clone(),
-                    cx,
-                )
-                .await?;
-            }
-
-            cx.update(|_, cx| {
-                TaskBoardStore::global(cx).update(cx, |store, cx| {
-                    store.update_task(
+                // A worktree that an earlier, partially-failed finish already
+                // archived and removed just needs dropping from the task.
+                let already_archived = cx.update(|_, cx| {
+                    TaskBoardStore::global(cx)
+                        .read(cx)
+                        .archived_worktrees_for_task(task_id)
+                        .any(|row| row.worktree_path == worktree_path)
+                })?;
+                if !already_archived || worktree_path.exists() {
+                    cleanup_task_worktree(
                         task_id,
-                        |task| task.worktree_paths = PathList::new::<PathBuf>(&[]),
+                        worktree_path.clone(),
+                        group_key.clone(),
+                        multi_workspace.clone(),
+                        source_workspace.clone(),
                         cx,
-                    );
-                });
-            })?;
+                    )
+                    .await?;
+                }
+
+                // Drop the path from the task as soon as it is handled so a
+                // failure on a later worktree can be retried without
+                // re-archiving this one.
+                cx.update(|_, cx| {
+                    TaskBoardStore::global(cx).update(cx, |store, cx| {
+                        store.update_task(
+                            task_id,
+                            |task| {
+                                let remaining: Vec<PathBuf> = task
+                                    .worktree_paths
+                                    .ordered_paths()
+                                    .filter(|path| **path != worktree_path)
+                                    .cloned()
+                                    .collect();
+                                task.worktree_paths = PathList::new(&remaining);
+                            },
+                            cx,
+                        );
+                    });
+                })?;
+            }
         }
 
         cx.update(|_, cx| {
@@ -762,8 +820,12 @@ pub fn reopen_task(
             };
             let path = restore_worktree_via_git(&archived, None, cx).await?;
             restored_paths.push(path);
+        }
 
-            // The state is restored on disk, so the protective ref can go.
+        // Only once every worktree is restored on disk can the protective
+        // refs go; deleting them per-row would leave earlier rows' checkpoint
+        // commits unprotected if a later restore fails and gets retried.
+        for row in &rows {
             if let Ok((main_repo, _temp_project)) =
                 find_or_create_repository(&row.main_repo_path, None, cx).await
             {
@@ -786,6 +848,75 @@ pub fn reopen_task(
                 );
                 store.clear_archived_worktrees(task_id, cx);
                 store.move_task(task_id, TaskStatus::InProgress, usize::MAX, cx);
+            });
+        })?;
+        Ok(())
+    })
+}
+
+/// Delete a task after a confirmation that spells out what is lost: records
+/// always; archived uncommitted changes become unrecoverable (their
+/// GC-protection refs are removed best-effort); live worktrees stay on disk.
+pub fn delete_task(
+    task_id: BoardTaskId,
+    _workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<Result<()>> {
+    let store = TaskBoardStore::global(cx);
+    let Some(task) = store.read(cx).task(task_id).cloned() else {
+        return Task::ready(Ok(()));
+    };
+    let archived_rows: Vec<TaskBoardArchivedWorktree> = store
+        .read(cx)
+        .archived_worktrees_for_task(task_id)
+        .cloned()
+        .collect();
+
+    let mut detail =
+        String::from("The task, its tags, and its session records will be permanently removed.");
+    if task.has_worktree() {
+        detail.push_str(
+            " Its worktrees and branch stay on disk; remove them with git if you \
+             no longer need them.",
+        );
+    }
+    if !archived_rows.is_empty() {
+        detail.push_str(
+            " The uncommitted changes archived when this task was finished will \
+             become unrecoverable.",
+        );
+    }
+
+    let answer = window.prompt(
+        gpui::PromptLevel::Warning,
+        "Delete this task?",
+        Some(&detail),
+        &["Delete", "Cancel"],
+        cx,
+    );
+
+    cx.spawn_in(window, async move |_, cx| {
+        if answer.await != Ok(0) {
+            return Ok(());
+        }
+
+        // The archived checkpoints are unreachable once the task's records
+        // are gone, so drop their GC-protection refs (best-effort).
+        for row in &archived_rows {
+            if let Ok((main_repo, _temp_project)) =
+                find_or_create_repository(&row.main_repo_path, None, cx).await
+            {
+                main_repo
+                    .update(cx, |repository, _| repository.delete_ref(row.ref_name.clone()))
+                    .await
+                    .ok();
+            }
+        }
+
+        cx.update(|_, cx| {
+            TaskBoardStore::global(cx).update(cx, |store, cx| {
+                store.delete_task(task_id, cx);
             });
         })?;
         Ok(())

@@ -15,13 +15,21 @@ const NEW_TASK_DRAFT_KEY: &str = "task_board_new_task_draft";
 
 /// What the user had typed into the modal when it was dismissed without
 /// creating a task; restored the next time the modal opens.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct NewTaskDraft {
     title: String,
     description: String,
     status: TaskStatus,
     project_id: Option<BoardProjectId>,
 }
+
+/// In-process copy of the latest draft. The database write is asynchronous,
+/// so dismissing and immediately reopening the modal would otherwise read a
+/// stale draft; this cache is updated synchronously and always wins.
+#[derive(Default)]
+struct NewTaskDraftCache(Option<NewTaskDraft>);
+
+impl gpui::Global for NewTaskDraftCache {}
 
 /// A human-readable name for a project derived from its root folder names.
 pub(crate) fn display_name_for_paths(paths: &PathList) -> SharedString {
@@ -118,11 +126,18 @@ impl NewTaskModal {
 
         let mut status = TaskStatus::Todo;
         let mut draft_restored = false;
-        let draft: Option<NewTaskDraft> = KeyValueStore::global(cx)
-            .read_kvp(NEW_TASK_DRAFT_KEY)
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).ok());
+        let cached_draft = cx
+            .try_global::<NewTaskDraftCache>()
+            .and_then(|cache| cache.0.clone());
+        let draft: Option<NewTaskDraft> = if cx.has_global::<NewTaskDraftCache>() {
+            cached_draft
+        } else {
+            KeyValueStore::global(cx)
+                .read_kvp(NEW_TASK_DRAFT_KEY)
+                .ok()
+                .flatten()
+                .and_then(|json| serde_json::from_str(&json).ok())
+        };
         if let Some(draft) = draft
             && (!draft.title.is_empty() || !draft.description.is_empty())
         {
@@ -157,6 +172,7 @@ impl NewTaskModal {
         let description = self.description_editor.read(cx).text(cx).trim().to_string();
         let kvp = KeyValueStore::global(cx);
         if title.is_empty() && description.is_empty() {
+            cx.set_global(NewTaskDraftCache(None));
             cx.background_spawn(async move {
                 kvp.delete_kvp(NEW_TASK_DRAFT_KEY.to_string()).await
             })
@@ -169,6 +185,7 @@ impl NewTaskModal {
             status: self.status,
             project_id: self.selected_project,
         };
+        cx.set_global(NewTaskDraftCache(Some(draft.clone())));
         if let Some(json) = serde_json::to_string(&draft).log_err() {
             cx.background_spawn(async move {
                 kvp.write_kvp(NEW_TASK_DRAFT_KEY.to_string(), json).await
@@ -186,6 +203,7 @@ impl NewTaskModal {
         });
         self.status = TaskStatus::Todo;
         self.draft_restored = false;
+        cx.set_global(NewTaskDraftCache(None));
         let kvp = KeyValueStore::global(cx);
         cx.background_spawn(async move { kvp.delete_kvp(NEW_TASK_DRAFT_KEY.to_string()).await })
             .detach_and_log_err(cx);
@@ -217,6 +235,7 @@ impl NewTaskModal {
             store.create_task(project_id, title.to_string().into(), description, self.status, cx);
         });
         self.created = true;
+        cx.set_global(NewTaskDraftCache(None));
         let kvp = KeyValueStore::global(cx);
         cx.background_spawn(async move { kvp.delete_kvp(NEW_TASK_DRAFT_KEY.to_string()).await })
             .detach_and_log_err(cx);

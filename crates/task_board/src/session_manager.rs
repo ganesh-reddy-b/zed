@@ -133,6 +133,19 @@ pub fn open_session(
             return Ok(());
         }
 
+        // The terminal isn't in this window's panel, but the session may
+        // still be live in another window — respawning here would start a
+        // second agent in the same worktree and orphan the running one.
+        let live_elsewhere = cx.update(|_, cx| {
+            TaskBoardStore::global(cx).read(cx).session_runtime(session_id)
+                != crate::SessionRuntimeState::Dormant
+        })?;
+        anyhow::ensure!(
+            !live_elsewhere,
+            "this session is running in another window; switch to it there or \
+             close it first"
+        );
+
         // The terminal is gone — respawn a shell in the saved cwd and type
         // the agent's resume command (falling back to its start command).
         let resume_command = session

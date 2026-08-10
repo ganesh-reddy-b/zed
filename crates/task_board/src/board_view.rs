@@ -29,7 +29,6 @@ struct DraggedTaskCard {
     task_id: BoardTaskId,
     title: SharedString,
     project_name: SharedString,
-    status: TaskStatus,
 }
 
 impl Render for DraggedTaskCard {
@@ -174,6 +173,12 @@ impl TaskBoardView {
                     this.recompute(cx);
                 }
             });
+        // Column visibility comes from settings (hidden_statuses), so a
+        // settings edit must recompute open boards.
+        let settings_subscription =
+            cx.observe_global::<settings::SettingsStore>(|this: &mut Self, cx| {
+                this.recompute(cx);
+            });
 
         // Keep PR statuses fresh while a board is visible; refreshes are
         // debounced in the store so multiple boards don't stack up.
@@ -218,7 +223,11 @@ impl TaskBoardView {
             board_scroll_handle: ScrollHandle::new(),
             gh_setup: None,
             gh_banner_dismissed: false,
-            _subscriptions: vec![store_subscription, filter_subscription],
+            _subscriptions: vec![
+                store_subscription,
+                filter_subscription,
+                settings_subscription,
+            ],
             _pr_refresh_task,
         };
         this.recompute(cx);
@@ -445,33 +454,14 @@ impl TaskBoardView {
         cx.notify();
     }
 
-    /// Index into the store's "column without the dragged task" ordering for
-    /// a drop before the card currently at `visual_index`.
-    fn drop_index(&self, dragged: &DraggedTaskCard, status: TaskStatus, visual_index: usize) -> usize {
-        if dragged.status != status {
-            return visual_index;
-        }
-        let dragged_visual_index = self
-            .columns
-            .iter()
-            .find(|column| column.status == status)
-            .and_then(|column| {
-                column
-                    .cards
-                    .iter()
-                    .position(|card| card.task_id == dragged.task_id)
-            });
-        match dragged_visual_index {
-            Some(dragged_index) if dragged_index < visual_index => visual_index - 1,
-            _ => visual_index,
-        }
-    }
-
+    /// Move the dragged task into `status`, before the card `before` (end of
+    /// the column when `None`). Anchoring on the target card rather than a
+    /// visual index keeps drops correct while the board is filtered.
     fn move_dragged_task(
         &mut self,
         dragged: &DraggedTaskCard,
         status: TaskStatus,
-        index: usize,
+        before: Option<BoardTaskId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -489,7 +479,7 @@ impl TaskBoardView {
             });
         } else {
             self.store.update(cx, |store, cx| {
-                store.move_task(task_id, status, index, cx);
+                store.move_task_before(task_id, status, before, cx);
             });
         }
     }
@@ -716,7 +706,7 @@ impl TaskBoardView {
                     .on_drop(cx.listener(
                         move |this, dragged: &DraggedTaskCard, window, cx| {
                             // Dropping on the column body appends to the end.
-                            this.move_dragged_task(dragged, status, usize::MAX, window, cx);
+                            this.move_dragged_task(dragged, status, None, window, cx);
                         },
                     ))
                     .when(card_count == 0, |this| {
@@ -751,7 +741,6 @@ impl TaskBoardView {
             task_id,
             title: card.title.clone(),
             project_name: card.project_name.clone(),
-            status,
         };
 
         let archived = card.archived;
@@ -948,8 +937,7 @@ impl TaskBoardView {
                     if dragged.task_id == task_id {
                         return;
                     }
-                    let index = this.drop_index(dragged, status, card_index);
-                    this.move_dragged_task(dragged, status, index, window, cx);
+                    this.move_dragged_task(dragged, status, Some(task_id), window, cx);
                 },
             ))
             .child(eyebrow)
@@ -1071,23 +1059,9 @@ fn build_card_menu(
             },
         );
         menu = menu.entry("Delete", None, move |window, cx| {
-            let answer = window.prompt(
-                gpui::PromptLevel::Warning,
-                "Delete this task?",
-                Some("The task, its tags, and its session records will be permanently removed."),
-                &["Delete", "Cancel"],
-                cx,
-            );
-            cx.spawn(async move |cx| {
-                if answer.await == Ok(0) {
-                    cx.update(|cx| {
-                        TaskBoardStore::global(cx).update(cx, |store, cx| {
-                            store.delete_task(task_id, cx);
-                        });
-                    });
-                }
-            })
-            .detach();
+            run_workspace_task(&workspace, window, cx, |workspace, window, cx| {
+                crate::task_lifecycle::delete_task(task_id, workspace, window, cx)
+            });
         });
         menu
     })

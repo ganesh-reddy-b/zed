@@ -383,16 +383,19 @@ impl Column for BoardTask {
         let (updated_at, next): (String, i32) = Column::column(statement, next)?;
 
         // Rows written before multi-project support only have the single
-        // worktree_path column.
-        let worktree_paths = match worktree_paths {
-            Some(paths) if !paths.is_empty() => PathList::deserialize(&SerializedPathList {
-                paths,
-                order: worktree_paths_order.unwrap_or_default(),
-            }),
-            _ => match path_from_string(worktree_path) {
-                Some(path) => PathList::new(&[path]),
-                None => PathList::new::<PathBuf>(&[]),
-            },
+        // worktree_path column. That column stays authoritative for
+        // emptiness: a pre-multi-project build finishing a task clears only
+        // it, and trusting a stale worktree_paths would resurrect
+        // already-archived worktrees after an upgrade.
+        let worktree_paths = match (path_from_string(worktree_path), worktree_paths) {
+            (None, _) => PathList::new::<PathBuf>(&[]),
+            (Some(_), Some(paths)) if !paths.is_empty() => {
+                PathList::deserialize(&SerializedPathList {
+                    paths,
+                    order: worktree_paths_order.unwrap_or_default(),
+                })
+            }
+            (Some(path), _) => PathList::new(&[path]),
         };
 
         Ok((

@@ -435,6 +435,13 @@ impl TaskBoardStore {
             .collect()
     }
 
+    pub fn session_runtime(&self, session_id: TaskSessionId) -> SessionRuntimeState {
+        self.runtime
+            .get(&session_id)
+            .copied()
+            .unwrap_or(SessionRuntimeState::Dormant)
+    }
+
     pub fn task_needs_attention(&self, task_id: BoardTaskId) -> bool {
         self.sessions_by_task
             .get(&task_id)
@@ -644,6 +651,27 @@ impl TaskBoardStore {
         self.enqueue(DbOperation::UpsertTask(task));
         cx.emit(TaskBoardStoreEvent::TaskChanged(task_id));
         cx.notify();
+    }
+
+    /// Move a task into `status` before `before` (or to the end when
+    /// `None`). Resolving the anchor task against the unfiltered column here
+    /// keeps drops correct while the board is filtered, where visual indices
+    /// and column indices diverge.
+    pub fn move_task_before(
+        &mut self,
+        task_id: BoardTaskId,
+        status: TaskStatus,
+        before: Option<BoardTaskId>,
+        cx: &mut Context<Self>,
+    ) {
+        let index = before
+            .and_then(|before_id| {
+                self.ordered_column_without(status, task_id)
+                    .iter()
+                    .position(|(id, _)| *id == before_id)
+            })
+            .unwrap_or(usize::MAX);
+        self.move_task(task_id, status, index, cx);
     }
 
     /// Move a task to `status` at position `index` within that column
