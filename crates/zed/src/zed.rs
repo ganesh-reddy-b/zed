@@ -5828,6 +5828,7 @@ mod tests {
                 "syntax_tree_view",
                 "tab_switcher",
                 "task",
+                "task_board",
                 "terminal",
                 "terminal_panel",
                 "text_finder",
@@ -6056,6 +6057,7 @@ mod tests {
                 false,
                 cx,
             );
+            task_board::init(cx);
 
             repl::init(app_state.fs.clone(), cx);
             repl::notebook::init(cx);

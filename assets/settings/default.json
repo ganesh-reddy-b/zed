@@ -1557,6 +1557,35 @@
   //
   // Default: true
   "word_diff_enabled": true,
+  // Configuration for the task board.
+  "task_board": {
+    // Agent CLIs available for task board sessions, keyed by name.
+    // Each entry has a "command" typed into the session's shell, and an
+    // optional "resume_command" used when restoring an archived session.
+    "agents": {
+      "claude": {
+        "command": "claude",
+        "resume_command": "claude --continue"
+      },
+      "codex": {
+        "command": "codex",
+        "resume_command": "codex resume --last"
+      },
+      "pi": {
+        "command": "pi"
+      }
+    },
+    // The agent used by default for new task board sessions.
+    "default_agent": "claude",
+    // Prefix for branch names generated when starting a task.
+    "branch_prefix": "task/",
+    // Task statuses hidden on the board.
+    "hidden_statuses": [],
+    // Whether to automatically archive a task's worktree (saving
+    // uncommitted changes restorably) when the task is marked done or
+    // cancelled.
+    "cleanup_worktree_on_done": true
+  },
   // Control what info is collected by Zed.
   "telemetry": {
     // Send debug info like crash reports.

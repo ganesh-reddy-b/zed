@@ -7365,6 +7365,20 @@ impl Sidebar {
                         this.toggle_archive(&ToggleThreadHistory, window, cx);
                     })),
             )
+            .child(
+                IconButton::new("task-board", IconName::ListTodo)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_, cx| {
+                        Tooltip::for_action(
+                            "Open Task Board",
+                            &zed_actions::task_board::Open,
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(zed_actions::task_board::Open.boxed_clone(), cx);
+                    }),
+            )
             .child(div().flex_1())
             .child(self.render_recent_projects_button(cx))
     }

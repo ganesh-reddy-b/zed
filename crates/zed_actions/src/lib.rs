@@ -421,6 +421,17 @@ pub mod project_panel {
         ]
     );
 }
+pub mod task_board {
+    use gpui::actions;
+
+    actions!(
+        task_board,
+        [
+            /// Opens the task board.
+            Open
+        ]
+    );
+}
 pub mod feedback {
     use gpui::actions;
 
