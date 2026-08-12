@@ -109,6 +109,9 @@ struct CardSnapshot {
     archived: bool,
     has_worktree: bool,
     can_reopen: bool,
+    /// The task's primary project has no git repository; the task runs in
+    /// place, without a worktree or branch.
+    non_git: bool,
 }
 
 #[derive(Clone)]
@@ -117,6 +120,27 @@ struct CardPr {
     label: SharedString,
     tooltip: SharedString,
     color: Color,
+}
+
+/// A compact warning chip marking a project without a git repository.
+pub(crate) fn non_git_badge(id: impl Into<gpui::ElementId>, cx: &App) -> impl IntoElement {
+    h_flex()
+        .id(id)
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(cx.theme().status().warning_border)
+        .bg(cx.theme().status().warning_background)
+        .tooltip(Tooltip::text(
+            "This project is not a git repository. Its tasks run directly in the \
+             project folder, without a worktree or branch.",
+        ))
+        .child(
+            Label::new("no git")
+                .size(LabelSize::XSmall)
+                .color(Color::Warning),
+        )
 }
 
 pub(crate) fn pr_state_color(state: crate::PrState) -> Color {
@@ -464,6 +488,7 @@ impl TaskBoardView {
                                     .archived_worktrees_for_task(task.task_id)
                                     .next()
                                     .is_some(),
+                            non_git: store.project_is_non_git(task.project_id),
                         }
                     })
                     .collect(),
@@ -489,7 +514,7 @@ impl TaskBoardView {
                 .store
                 .read(cx)
                 .task(task_id)
-                .is_some_and(|task| task.has_worktree());
+                .is_some_and(|task| task.has_worktree() && !task.runs_in_place());
 
         if needs_finish_flow {
             run_workspace_task(&self.workspace, window, cx, |workspace, window, cx| {
@@ -701,6 +726,7 @@ impl TaskBoardView {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(Label::new("Task Board"))
+            .children(self.workspace_non_git_badge(cx))
             .child(self.render_project_filter(window, cx))
             .child(self.render_sections_menu(cx))
             .child(
@@ -733,6 +759,21 @@ impl TaskBoardView {
                         window.dispatch_action(NewTask.boxed_clone(), cx);
                     }),
             )
+    }
+
+    /// A persistent "no git" badge shown while the board's workspace is open
+    /// on a project without a git repository.
+    fn workspace_non_git_badge(&self, cx: &App) -> Option<gpui::AnyElement> {
+        let workspace = self.workspace.as_ref()?.upgrade()?;
+        let group_key = ProjectGroupKey::from_project(workspace.read(cx).project().read(cx), cx);
+        if group_key.path_list().is_empty() {
+            return None;
+        }
+        let store = self.store.read(cx);
+        let project = store.project_for_group_key(&group_key)?;
+        store
+            .project_is_non_git(project.project_id)
+            .then(|| non_git_badge("board-workspace-non-git", cx).into_any_element())
     }
 
     fn render_project_filter(
@@ -895,9 +936,15 @@ impl TaskBoardView {
         let archived = card.archived;
         let has_worktree = card.has_worktree;
         let can_reopen = card.can_reopen;
+        // Worktree tasks always carry a branch; a branchless task with paths
+        // runs in place in a non-git project folder.
+        let in_place = has_worktree && card.branch_name.is_none();
 
         let (primary_icon, primary_tooltip) = if has_worktree {
-            (IconName::FolderOpen, "Open Worktree")
+            (
+                IconName::FolderOpen,
+                if in_place { "Open Project" } else { "Open Worktree" },
+            )
         } else if can_reopen {
             (IconName::HistoryRerun, "Reopen Task")
         } else {
@@ -908,17 +955,28 @@ impl TaskBoardView {
             .gap_1()
             .justify_between()
             .child(
-                div()
-                    .id(SharedString::from(format!("task-project-{key}")))
+                h_flex()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(10.))
-                    .text_color(cx.theme().colors().text_muted)
-                    .truncate()
-                    .when_some(card.project_tooltip.clone(), |this, tooltip| {
-                        this.tooltip(Tooltip::text(tooltip))
-                    })
-                    .child(card.project_name.clone()),
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("task-project-{key}")))
+                            .min_w_0()
+                            .text_size(px(10.))
+                            .text_color(cx.theme().colors().text_muted)
+                            .truncate()
+                            .when_some(card.project_tooltip.clone(), |this, tooltip| {
+                                this.tooltip(Tooltip::text(tooltip))
+                            })
+                            .child(card.project_name.clone()),
+                    )
+                    .when(card.non_git, |this| {
+                        this.child(non_git_badge(
+                            SharedString::from(format!("task-non-git-{key}")),
+                            cx,
+                        ))
+                    }),
             )
             .child(
                 h_flex()
@@ -981,6 +1039,7 @@ impl TaskBoardView {
                                         task_id,
                                         archived,
                                         has_worktree,
+                                        in_place,
                                         can_reopen,
                                         workspace.clone(),
                                         window,
@@ -1131,6 +1190,7 @@ impl TaskBoardView {
                     task_id,
                     archived,
                     has_worktree,
+                    in_place,
                     can_reopen,
                     workspace.clone(),
                     window,
@@ -1146,6 +1206,7 @@ fn build_card_menu(
     task_id: BoardTaskId,
     archived: bool,
     has_worktree: bool,
+    in_place: bool,
     can_reopen: bool,
     workspace: Option<WeakEntity<Workspace>>,
     window: &mut Window,
@@ -1154,19 +1215,28 @@ fn build_card_menu(
     ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
         if has_worktree {
             let workspace = workspace.clone();
-            menu = menu.entry("Open Worktree", None, {
-                let workspace = workspace.clone();
-                move |window, cx| {
+            menu = menu.entry(
+                if in_place { "Open Project" } else { "Open Worktree" },
+                None,
+                {
+                    let workspace = workspace.clone();
+                    move |window, cx| {
+                        run_workspace_task(&workspace, window, cx, |workspace, window, cx| {
+                            crate::task_lifecycle::open_task_worktree(
+                                task_id, workspace, window, cx,
+                            )
+                        });
+                    }
+                },
+            );
+            // In-place tasks have no branch, so there is nothing to publish.
+            if !in_place {
+                menu = menu.entry("Create Pull Request", None, move |window, cx| {
                     run_workspace_task(&workspace, window, cx, |workspace, window, cx| {
-                        crate::task_lifecycle::open_task_worktree(task_id, workspace, window, cx)
+                        crate::task_lifecycle::create_pull_request(task_id, workspace, window, cx)
                     });
-                }
-            });
-            menu = menu.entry("Create Pull Request", None, move |window, cx| {
-                run_workspace_task(&workspace, window, cx, |workspace, window, cx| {
-                    crate::task_lifecycle::create_pull_request(task_id, workspace, window, cx)
                 });
-            });
+            }
         } else if can_reopen {
             let workspace = workspace.clone();
             menu = menu.entry("Reopen Task", None, move |window, cx| {
@@ -1317,6 +1387,19 @@ impl Item for TaskBoardView {
         cx: &mut Context<Self>,
     ) {
         self.workspace = Some(workspace.weak_handle());
+        // Register the workspace's project so the board can always tell (and
+        // show) whether the project being viewed is a git repository.
+        let group_key = ProjectGroupKey::from_project(workspace.project().read(cx), cx);
+        if !group_key.path_list().is_empty() {
+            self.store.update(cx, |store, cx| {
+                store.register_project(
+                    group_key.path_list().clone(),
+                    group_key.host(),
+                    crate::new_task_modal::display_name_for_paths(group_key.path_list()),
+                    cx,
+                );
+            });
+        }
         // Folders added to or removed from the workspace change what the
         // workspace-projects filter matches.
         self._project_subscription = Some(cx.subscribe(

@@ -150,6 +150,38 @@ pub fn start_task(
                 .await?
         };
 
+        // A project without a git repository can get neither a worktree nor
+        // a branch. Instead of failing, run the task in place: record the
+        // project's own folders as the task's working paths and move it to
+        // In Progress, so sessions run directly in the project directory.
+        let git_check_paths: Vec<PathBuf> = combined_paths.ordered_paths().cloned().collect();
+        let has_git_repo = cx
+            .background_executor()
+            .spawn(async move {
+                git_check_paths
+                    .iter()
+                    .any(|path| crate::task_store::path_is_in_git_repo(path))
+            })
+            .await;
+        if !has_git_repo {
+            cx.update(|_, cx| {
+                TaskBoardStore::global(cx).update(cx, |store, cx| {
+                    store.update_task(
+                        task_id,
+                        |task| task.worktree_paths = combined_paths.clone(),
+                        cx,
+                    );
+                    let needs_move = store
+                        .task(task_id)
+                        .is_some_and(|task| task.status != TaskStatus::InProgress);
+                    if needs_move {
+                        store.move_task(task_id, TaskStatus::InProgress, usize::MAX, cx);
+                    }
+                });
+            })?;
+            return Ok(());
+        }
+
         let repositories = wait_for_repositories(&project_workspace, cx).await?;
         let repository = repositories
             .first()
@@ -279,7 +311,11 @@ pub fn create_pull_request(
         return Task::ready(Err(anyhow!("task no longer exists")));
     };
     let Some(branch_name) = task.branch_name.clone() else {
-        return Task::ready(Err(anyhow!("start the task first to create its branch")));
+        return Task::ready(Err(anyhow!(if task.runs_in_place() {
+            "this task's project is not a git repository, so it has no branch to publish"
+        } else {
+            "start the task first to create its branch"
+        })));
     };
     // Multi-project tasks publish the primary project's branch; other repos'
     // branches can be pushed from their own worktrees.
@@ -520,7 +556,7 @@ pub fn request_status_change(
         && store
             .read(cx)
             .task(task_id)
-            .is_some_and(|task| task.has_worktree());
+            .is_some_and(|task| task.has_worktree() && !task.runs_in_place());
 
     if needs_finish_flow {
         finish_task(task_id, status, workspace, window, cx)
@@ -547,7 +583,10 @@ pub fn finish_task(
         return Task::ready(Err(anyhow!("task no longer exists")));
     };
     let worktree_paths: Vec<PathBuf> = task.worktree_paths.ordered_paths().cloned().collect();
-    if worktree_paths.is_empty() {
+    // In-place tasks (non-git projects) record the project's own folders as
+    // their working paths; there is no task-created worktree to archive or
+    // remove, and the cleanup below must never touch the project itself.
+    if worktree_paths.is_empty() || task.runs_in_place() {
         store.update(cx, |store, cx| {
             store.move_task(task_id, status, usize::MAX, cx);
         });
@@ -875,7 +914,7 @@ pub fn delete_task(
 
     let mut detail =
         String::from("The task, its tags, and its session records will be permanently removed.");
-    if task.has_worktree() {
+    if task.has_worktree() && !task.runs_in_place() {
         detail.push_str(
             " Its worktrees and branch stay on disk; remove them with git if you \
              no longer need them.",

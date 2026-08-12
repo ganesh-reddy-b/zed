@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use agent_ui::{AgentPanel, AgentPanelEvent, TerminalId};
 use anyhow::Context as _;
 use chrono::Utc;
@@ -19,6 +21,13 @@ use crate::task_db::{
 /// Minimum gap between adjacent sort orders before the column is
 /// renormalized to whole numbers.
 const MIN_SORT_ORDER_GAP: f64 = 1e-9;
+
+/// Whether `path` is inside a git repository. `.git` may be a directory or,
+/// for linked worktrees and submodules, a file.
+pub(crate) fn path_is_in_git_repo(path: &Path) -> bool {
+    path.ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+}
 
 struct GlobalTaskBoardStore(Entity<TaskBoardStore>);
 impl Global for GlobalTaskBoardStore {}
@@ -129,6 +138,10 @@ pub struct TaskBoardStore {
     sessions: HashMap<TaskSessionId, TaskSession>,
     archived_worktrees: HashMap<BoardTaskId, Vec<TaskBoardArchivedWorktree>>,
     prs: HashMap<BoardTaskId, Vec<TaskPullRequest>>,
+    /// Local projects whose folders are not inside a git repository, checked
+    /// on disk in the background. Transient; recomputed on reload and
+    /// registration.
+    non_git_projects: HashSet<BoardProjectId>,
     tasks_by_project: HashMap<BoardProjectId, HashSet<BoardTaskId>>,
     sessions_by_task: HashMap<BoardTaskId, Vec<TaskSessionId>>,
     session_by_terminal: HashMap<String, TaskSessionId>,
@@ -191,6 +204,7 @@ impl TaskBoardStore {
             sessions: HashMap::default(),
             archived_worktrees: HashMap::default(),
             prs: HashMap::default(),
+            non_git_projects: HashSet::default(),
             tasks_by_project: HashMap::default(),
             sessions_by_task: HashMap::default(),
             session_by_terminal: HashMap::default(),
@@ -322,6 +336,7 @@ impl TaskBoardStore {
                         this.prs.entry(pr.task_id).or_default().push(pr);
                     }
 
+                    this.refresh_project_git_states(cx);
                     cx.emit(TaskBoardStoreEvent::Reloaded);
                     cx.notify();
                 })
@@ -365,6 +380,64 @@ impl TaskBoardStore {
 
     pub fn project(&self, project_id: BoardProjectId) -> Option<&BoardProject> {
         self.projects.get(&project_id)
+    }
+
+    /// Whether the project's folders lack a git repository. Tasks in such
+    /// projects run directly in the project folder — no worktree or branch —
+    /// and board surfaces mark them with a "no git" indicator.
+    pub fn project_is_non_git(&self, project_id: BoardProjectId) -> bool {
+        self.non_git_projects.contains(&project_id)
+    }
+
+    /// Re-derive which local projects lack a git repository, checking the
+    /// filesystem in the background and emitting `ProjectChanged` for any
+    /// project whose state flipped (e.g. after `git init`).
+    fn refresh_project_git_states(&mut self, cx: &mut Context<Self>) {
+        let candidates: Vec<(BoardProjectId, Vec<PathBuf>)> = self
+            .projects
+            .values()
+            .filter(|project| project.remote_connection.is_none())
+            .map(|project| {
+                (
+                    project.project_id,
+                    project
+                        .main_worktree_paths
+                        .ordered_paths()
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let non_git: HashSet<BoardProjectId> = cx
+                .background_spawn(async move {
+                    candidates
+                        .into_iter()
+                        .filter(|(_, paths)| {
+                            !paths.is_empty()
+                                && !paths.iter().any(|path| path_is_in_git_repo(path))
+                        })
+                        .map(|(project_id, _)| project_id)
+                        .collect()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.non_git_projects != non_git {
+                    let changed: Vec<BoardProjectId> = this
+                        .non_git_projects
+                        .symmetric_difference(&non_git)
+                        .copied()
+                        .collect();
+                    this.non_git_projects = non_git;
+                    for project_id in changed {
+                        cx.emit(TaskBoardStoreEvent::ProjectChanged(project_id));
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn task(&self, task_id: BoardTaskId) -> Option<&BoardTask> {
@@ -576,6 +649,7 @@ impl TaskBoardStore {
         let project_id = project.project_id;
         self.projects.insert(project_id, project.clone());
         self.enqueue(DbOperation::UpsertProject(project));
+        self.refresh_project_git_states(cx);
         cx.emit(TaskBoardStoreEvent::ProjectChanged(project_id));
         cx.notify();
         project_id
@@ -1197,6 +1271,41 @@ mod tests {
                     .map(|task| task.task_id),
                 Some(archived),
                 "query should match case-insensitively"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_non_git_project_detection(cx: &mut TestAppContext) {
+        let store = init_test(cx);
+        store.read_with(cx, |store, _| store.reload_task()).await;
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let git_dir = temp.path().join("with-git");
+        std::fs::create_dir_all(git_dir.join(".git")).expect("create git project");
+        let nested_dir = git_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested folder");
+        let plain_dir = temp.path().join("plain");
+        std::fs::create_dir_all(&plain_dir).expect("create plain project");
+
+        let git_project = store.update(cx, |store, cx| {
+            store.register_project(PathList::new(&[git_dir]), None, "with-git".into(), cx)
+        });
+        // A folder nested inside a repository counts as git too.
+        let nested_project = store.update(cx, |store, cx| {
+            store.register_project(PathList::new(&[nested_dir]), None, "nested".into(), cx)
+        });
+        let plain_project = store.update(cx, |store, cx| {
+            store.register_project(PathList::new(&[plain_dir]), None, "plain".into(), cx)
+        });
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert!(!store.project_is_non_git(git_project));
+            assert!(!store.project_is_non_git(nested_project));
+            assert!(
+                store.project_is_non_git(plain_project),
+                "a project without a .git anywhere above it must be flagged"
             );
         });
     }

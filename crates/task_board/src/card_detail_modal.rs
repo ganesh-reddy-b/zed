@@ -389,6 +389,7 @@ impl CardDetailModal {
             .project(project_id)
             .map(|project| project.display_name.clone())
             .unwrap_or_else(|| "Unknown project".into());
+        let non_git = self.store.read(cx).project_is_non_git(project_id);
         let task_id = self.task_id;
 
         h_flex()
@@ -402,6 +403,15 @@ impl CardDetailModal {
                     .color(Color::Muted),
             )
             .child(Label::new(name).size(LabelSize::Small))
+            .when(non_git, |this| {
+                this.child(crate::board_view::non_git_badge(
+                    SharedString::from(format!(
+                        "project-non-git-{}",
+                        project_id.to_key_string()
+                    )),
+                    cx,
+                ))
+            })
             .when(is_primary, |this| {
                 this.child(
                     Label::new("primary")
@@ -535,6 +545,8 @@ impl Render for CardDetailModal {
         let task_id = self.task_id;
 
         let has_worktree = task.has_worktree();
+        let in_place = task.runs_in_place();
+        let non_git = self.store.read(cx).project_is_non_git(task.project_id);
         let can_reopen = !has_worktree
             && self
                 .store
@@ -543,7 +555,10 @@ impl Render for CardDetailModal {
                 .next()
                 .is_some();
         let (primary_icon, primary_label) = if has_worktree {
-            (IconName::FolderOpen, "Open Worktree")
+            (
+                IconName::FolderOpen,
+                if in_place { "Open Project" } else { "Open Worktree" },
+            )
         } else if can_reopen {
             (IconName::HistoryRerun, "Reopen Task")
         } else {
@@ -579,6 +594,9 @@ impl Render for CardDetailModal {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
+                    .when(non_git, |this| {
+                        this.child(crate::board_view::non_git_badge("card-detail-non-git", cx))
+                    })
                     .when_some(task.branch_name.clone(), |this, branch| {
                         let copied_branch = branch.clone();
                         this.child(
@@ -723,9 +741,14 @@ impl Render for CardDetailModal {
             })
             .when(prs.is_empty(), |this| {
                 this.child(
-                    Label::new("No pull requests for this task's branch yet")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Label::new(if in_place {
+                        "This task's project is not a git repository, so it has no \
+                         branch or pull requests"
+                    } else {
+                        "No pull requests for this task's branch yet"
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
                 )
             })
             .children(

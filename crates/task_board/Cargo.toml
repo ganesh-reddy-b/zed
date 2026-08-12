@@ -47,4 +47,5 @@ zed_actions.workspace = true
 db = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
+tempfile.workspace = true
 zlog.workspace = true

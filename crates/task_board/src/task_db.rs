@@ -195,6 +195,15 @@ impl BoardTask {
         !self.worktree_paths.is_empty()
     }
 
+    /// True when the task runs directly in its project's folders because the
+    /// project has no git repository. Started tasks in git projects always
+    /// get a branch alongside their worktree, so a branchless task with
+    /// worktree paths is in-place: there is no task-created worktree to
+    /// archive or remove.
+    pub fn runs_in_place(&self) -> bool {
+        self.has_worktree() && self.branch_name.is_none()
+    }
+
     pub fn all_project_ids(&self) -> impl Iterator<Item = BoardProjectId> + '_ {
         std::iter::once(self.project_id).chain(self.extra_project_ids.iter().copied())
     }
