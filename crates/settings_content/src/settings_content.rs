@@ -8,6 +8,7 @@ mod language_model;
 pub mod merge_from;
 mod project;
 mod serde_helper;
+mod task_board;
 mod terminal;
 mod theme;
 mod title_bar;
@@ -27,6 +28,7 @@ pub use serde_helper::{
     serialize_f32_with_two_decimal_places, serialize_optional_f32_with_two_decimal_places,
 };
 use settings_json::parse_json_with_comments;
+pub use task_board::*;
 pub use terminal::*;
 pub use theme::*;
 pub use title_bar::*;
@@ -237,6 +239,9 @@ pub struct SettingsContent {
     pub outline_panel: Option<OutlinePanelSettingsContent>,
 
     pub project_panel: Option<ProjectPanelSettingsContent>,
+
+    /// Configuration for the task board.
+    pub task_board: Option<TaskBoardSettingsContent>,
 
     /// Configuration for Node-related features
     pub node: Option<NodeBinarySettings>,

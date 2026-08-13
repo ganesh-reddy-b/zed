@@ -163,16 +163,39 @@ impl MaxIdleRetainedThreads {
 pub struct TerminalId(uuid::Uuid);
 
 impl TerminalId {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
     }
 
-    pub(crate) fn to_key_string(self) -> String {
+    pub fn to_key_string(self) -> String {
         self.0.hyphenated().to_string()
     }
 
-    pub(crate) fn from_key_string(key: &str) -> anyhow::Result<Self> {
+    pub fn from_key_string(key: &str) -> anyhow::Result<Self> {
         Ok(Self(uuid::Uuid::parse_str(key)?))
+    }
+}
+
+/// What to type into a freshly spawned agent panel terminal.
+#[derive(Clone, Debug, Default)]
+pub enum TerminalInitCommand {
+    /// Run the `agent.terminal_init_command` setting, if configured.
+    #[default]
+    Default,
+    /// Don't run any init command.
+    None,
+    /// Type this specific command into the new shell.
+    Override(String),
+}
+
+impl TerminalInitCommand {
+    fn resolve(self, cx: &App) -> Option<String> {
+        match self {
+            Self::Default => AgentSettings::get_global(cx).terminal_init_command.clone(),
+            Self::None => None,
+            Self::Override(command) => Some(command),
+        }
+        .filter(|command| !command.trim().is_empty())
     }
 }
 
@@ -1978,11 +2001,43 @@ impl AgentPanel {
             None,
             true,
             true,
-            true,
+            TerminalInitCommand::Default,
             source,
             window,
             cx,
         );
+    }
+
+    /// Spawn a terminal thread with an explicit init command, returning its
+    /// id so callers (e.g. the task board) can track it. Returns `None` when
+    /// the project doesn't support terminals.
+    pub fn spawn_terminal_with_init_command(
+        &mut self,
+        working_directory: Option<PathBuf>,
+        custom_title: Option<SharedString>,
+        init_command: TerminalInitCommand,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TerminalId> {
+        if !self.supports_terminal(cx) {
+            return None;
+        }
+        let terminal_id = TerminalId::new();
+        self.spawn_terminal(
+            terminal_id,
+            working_directory,
+            custom_title,
+            None,
+            None,
+            true,
+            true,
+            init_command,
+            source,
+            window,
+            cx,
+        );
+        Some(terminal_id)
     }
 
     fn terminal_working_directory(
@@ -2032,13 +2087,13 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
-        run_init_command: bool,
+        init_command: TerminalInitCommand,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = init_command.resolve(cx);
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
         });
@@ -2090,13 +2145,6 @@ impl AgentPanel {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
-    }
-
-    fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
-        run_init_command
-            .then(|| AgentSettings::get_global(cx).terminal_init_command.clone())
-            .flatten()
-            .filter(|command| !command.trim().is_empty())
     }
 
     fn write_terminal_init_command(
@@ -2407,6 +2455,30 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.restore_terminal_with_init_command(
+            metadata,
+            TerminalInitCommand::Default,
+            focus,
+            source,
+            workspace,
+            window,
+            cx,
+        );
+    }
+
+    /// Like [`Self::restore_terminal`], but with an explicit init command —
+    /// e.g. an agent CLI's resume command when the task board restores an
+    /// archived session.
+    pub fn restore_terminal_with_init_command(
+        &mut self,
+        metadata: TerminalThreadMetadata,
+        init_command: TerminalInitCommand,
+        focus: bool,
+        source: AgentThreadSource,
+        workspace: Option<&Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.has_terminal(metadata.terminal_id) {
             self.activate_terminal(metadata.terminal_id, focus, window, cx);
             return;
@@ -2427,7 +2499,7 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            init_command,
             source,
             window,
             cx,
@@ -5131,7 +5203,7 @@ impl AgentPanel {
             None,
             true,
             false,
-            true,
+            TerminalInitCommand::Default,
             source,
             window,
             cx,
@@ -5155,7 +5227,7 @@ impl AgentPanel {
             None,
             true,
             false,
-            true,
+            TerminalInitCommand::Default,
             source,
             window,
             cx,
@@ -6682,7 +6754,7 @@ impl AgentPanel {
             None,
             focus,
             focus,
-            true,
+            TerminalInitCommand::Default,
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -6719,7 +6791,7 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            TerminalInitCommand::Default,
             source,
             window,
             cx,
@@ -6736,12 +6808,12 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
-        run_init_command: bool,
+        init_command: TerminalInitCommand,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = init_command.resolve(cx);
         let settings = TerminalSettings::get_global(cx).clone();
         let path_style = self.project.read(cx).path_style(cx);
         let builder = terminal::TerminalBuilder::new_display_only(
@@ -7599,7 +7671,7 @@ mod tests {
                 None,
                 true,
                 true,
-                true,
+                TerminalInitCommand::Default,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
@@ -9100,7 +9172,7 @@ mod tests {
                     None,
                     true,
                     true,
-                    false,
+                    TerminalInitCommand::None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
